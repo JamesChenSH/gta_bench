@@ -1,0 +1,8 @@
+/data
+/outputs
+/__pycache__
+/.DS_Store
+/.vscode
+*.log
+*.json
+test_*
