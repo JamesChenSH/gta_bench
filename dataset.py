@@ -28,26 +28,63 @@ def organize_dialogs_correct(sample: dict, path: str) -> List[dict]:
     """
     dialogs = []
     file_paths = get_all_file_paths(path)
+    tool_call_counter = 1  # Counter for generating tool call IDs
+    current_tool_call_id = None  # Track the current tool call ID for matching responses
     
     for item in sample['dialogs']:
         if item['role'] == 'tool':
-            # Tool response - keep as is
+            # Tool response - ensure proper format
+            content = item['content']
+            # Convert nested content structure to string if needed
+            if isinstance(content, dict) and 'content' in content:
+                content = content['content']
+            elif isinstance(content, dict):
+                content = str(content)
+            
             dialog = dict(
                 role='tool',
                 name=item['name'],
-                content=item['content'],
+                content=content,
+                tool_call_id=current_tool_call_id or f"call_{tool_call_counter}"  # Use the matching tool call ID
             )
             dialogs.append(dialog)
         elif item['role'] == 'assistant' and 'tool_calls' in item.keys():
             # Assistant with tool calls - ensure proper format
             dialog = copy.deepcopy(item)
             
-            # Update file paths to absolute paths if needed
+            # Ensure content field exists (required by OpenAI API and chat templates)
+            if 'content' not in dialog:
+                dialog['content'] = ""  # Empty string if no content
+            elif dialog['content'] is None:
+                dialog['content'] = ""  # Convert None to empty string
+            
+            # Process each tool call
             for tool_call in dialog.get('tool_calls', []):
+                # Add required id field if missing
+                if 'id' not in tool_call:
+                    tool_call['id'] = f"call_{tool_call_counter}"
+                    current_tool_call_id = tool_call['id']  # Track this ID for the next tool response
+                    tool_call_counter += 1
+                else:
+                    current_tool_call_id = tool_call['id']
+                
+                # Ensure arguments are JSON string format
                 if 'function' in tool_call and 'arguments' in tool_call['function']:
-                    for name, value in tool_call['function']['arguments'].items():
-                        if isinstance(value, str) and os.path.join(path, value) in file_paths:
-                            tool_call['function']['arguments'][name] = os.path.join(path, value)
+                    arguments = tool_call['function']['arguments']
+                    if isinstance(arguments, dict):
+                        # Convert dict to JSON string
+                        tool_call['function']['arguments'] = json.dumps(arguments)
+                    
+                    # Update file paths to absolute paths if needed
+                    try:
+                        args_dict = json.loads(tool_call['function']['arguments']) if isinstance(tool_call['function']['arguments'], str) else arguments
+                        for name, value in args_dict.items():
+                            if isinstance(value, str) and os.path.join(path, value) in file_paths:
+                                args_dict[name] = os.path.join(path, value)
+                        tool_call['function']['arguments'] = json.dumps(args_dict)
+                    except (json.JSONDecodeError, TypeError):
+                        # If arguments can't be parsed as JSON, leave as is
+                        pass
             
             dialogs.append(dialog)
         else:

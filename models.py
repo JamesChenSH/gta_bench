@@ -126,7 +126,17 @@ class GTAModel:
             if 'choices' in result and len(result['choices']) > 0:
                 choice = result['choices'][0]
                 message = choice['message']
-                
+
+                if 'tool_call' in message['content']:
+                    message['tool_calls'] = [
+                        {
+                            "function": json.loads(message['content'].split('<tool_call>')[1].split('</tool_call>')[0]),
+                            "id": "call_1"
+                        }
+                    ]
+                else:
+                    message['tool_calls'] = []
+
                 return {
                     'success': True,
                     'message': message,
@@ -188,7 +198,7 @@ class GTAAgent:
         
         # Add system message if files are provided
         if files:
-            file_info = "Available files: " + ", ".join([f"`{f['path']}`" for f in files])
+            file_info = "For image related tools, you can pass in the image path as a string for them to read them. These are the paths to the images related to the conversation: " + ", ".join([f"`{f['path']}`" for f in files])
             messages.append({'role': 'system', 'content': file_info})
         
         # Add user query
@@ -260,7 +270,7 @@ class GTAAgent:
         
         # Add system message if files are provided
         if files:
-            file_info = "Available files: " + ", ".join([f"`{f['path']}`" for f in files])
+            file_info = "You are a helpful assistant that can use the following files to answer the user's question. These are the files: " + ", ".join([f"`{f['path']}`" for f in files])
             messages.append({'role': 'system', 'content': file_info})
         
         # Add the provided chat history

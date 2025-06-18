@@ -13,6 +13,9 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
+import copy
+from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -29,6 +32,25 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def setup_output_dir(config_file: str) -> str:
+    """Create timestamped output directory using model_alias from config."""
+    # Read model_alias from config file
+    try:
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+            model_alias = config.get('models')[0].get('model_alias')
+            if not model_alias:
+                raise ValueError(f"No model_alias found in config file: {config_file}")
+    except Exception as e:
+        logger.error(f"Failed to read model_alias from config: {e}")
+        raise
+    
+    # Create timestamped output directory
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = os.path.join('outputs', f'{timestamp}_{model_alias}')
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
 
 
 def parse_args():
@@ -52,7 +74,7 @@ def parse_args():
                        help='Save steps')
     parser.add_argument('--step_by_step', action='store_true', default=True,
                        help='Enable step-by-step evaluation with ground truth tool outputs')
-    parser.add_argument('--n_samples', type=int, default=10,
+    parser.add_argument('--n_samples', type=int, default=500,
                        help='Number of samples to evaluate')
     return parser.parse_args()
 
@@ -91,12 +113,43 @@ def create_model(config_file: str, model_name: str, temperature: float) -> GTAMo
         raise
 
 
+def _analyze_tool_call_arguments(tool_call: Dict) -> str:
+    """Analyze and format tool call arguments for display."""
+    if 'function' not in tool_call:
+        return "No function found in tool call"
+    
+    function = tool_call['function']
+    tool_name = function.get('name', 'Unknown')
+    arguments = function.get('arguments', {})
+    
+    if isinstance(arguments, dict):
+        # Arguments are already parsed
+        args_str = ", ".join([f"{k}={v}" for k, v in arguments.items()])
+        return f"{tool_name}({args_str})"
+    elif isinstance(arguments, str):
+        # Arguments are still a JSON string
+        try:
+            import json
+            parsed_args = json.loads(arguments)
+            args_str = ", ".join([f"{k}={v}" for k, v in parsed_args.items()])
+            return f"{tool_name}({args_str})"
+        except (json.JSONDecodeError, TypeError):
+            return f"{tool_name}({arguments})"
+    else:
+        return f"{tool_name}({arguments})"
+
+
 def extract_assistant_steps(dialogs: List[Dict]) -> List[Dict]:
     """Extract only assistant steps from the dialog (excluding user and tool messages)."""
     assistant_steps = []
     for msg in dialogs:
-        if msg.get('role') == 'assistant':
-            assistant_steps.append(msg)
+        if msg.get('role') != 'assistant':
+            continue
+        assistant_msg = copy.deepcopy(msg)
+        if 'tool_calls' in assistant_msg:
+            for tool_call in assistant_msg['tool_calls']:
+                tool_call['function']['arguments'] = json.loads(tool_call['function']['arguments'])
+        assistant_steps.append(assistant_msg)
     return assistant_steps
 
 
@@ -162,6 +215,7 @@ def run_step_by_step_evaluation(model: GTAModel, sample: Dict) -> Dict:
         
         # Run evaluation for each step
         for step_idx in range(len(gold_steps)):
+            # logger.info(f"Step {step_idx + 1}/{len(gold_steps)}")
             try:
                 # Build chat history for this step
                 chat_history = build_chat_history_for_step(ground_truth_dialogs, step_idx)
@@ -282,8 +336,8 @@ def run_evaluation(model: GTAModel, dataset: GTADataset,
     total_steps = 0
     successful_steps = 0
     
-    for idx, sample in enumerate(dataset[:n_samples]):
-        logger.info(f"Processing sample {idx + 1}/{len(dataset)} (ID: {sample['idx']})")
+    for idx, sample in tqdm(enumerate(dataset[:n_samples]), total=min(n_samples, len(dataset))):
+        # logger.info(f"Processing sample {idx + 1}/{len(dataset)} (ID: {sample['idx']})")
         
         if step_by_step:
             result = run_step_by_step_evaluation(model, sample)
@@ -330,66 +384,137 @@ def calculate_step_by_step_metrics(results: List[Dict], output_dir: str) -> Dict
     logger.info("Calculating step-by-step evaluation metrics")
     
     try:
-        # Prepare data for evaluation
+        # Initialize counters for step-by-step metrics
+        total_samples = len(results)
+        total_steps = 0
+        successful_steps = 0
+        
+        # GTA benchmark specific metrics
+        total_tool_steps = 0
+        total_answer_steps = 0
+        inst_align_count = 0
+        tool_acc_count = 0
+        args_acc_count = 0
+        answer_acc_count = 0
+        tool_call_count = 0
+        tool_call_error_count = 0
+        
+        # Prepare data for traditional evaluator as backup
         all_predictions = []
         all_ground_truths = []
         all_references = []
         
-        total_samples = len(results)
-        total_steps = 0
-        successful_steps = 0
-        step_accuracy_scores = []
-        
         for result in results:
             if 'error' in result:
+                all_predictions.append([])
+                all_ground_truths.append([])
+                all_references.append(result.get('reference'))
                 continue
                 
             gold_steps = result.get('gold', [])
             pred_steps = result.get('prediction', [])
+            reference = result.get('reference')
             
             total_steps += len(gold_steps)
             
-            # Calculate step-level accuracy
-            for i, (gold_step, pred_step) in enumerate(zip(gold_steps, pred_steps)):
-                if 'error' not in pred_step:
+            # Pad shorter sequence with empty steps for comparison
+            max_len = max(len(gold_steps), len(pred_steps))
+            padded_gold = gold_steps + [{}] * (max_len - len(gold_steps))
+            padded_pred = pred_steps + [{}] * (max_len - len(pred_steps))
+            
+            # Step-by-step comparison
+            for i, (gold_step, pred_step) in enumerate(zip(padded_gold, padded_pred)):
+                if not gold_step:  # Skip padding
+                    continue
+                    
+                # Determine step types
+                gold_type = _get_step_type(gold_step)
+                pred_type = _get_step_type(pred_step) if pred_step else 'error'
+                
+                # Count step types
+                if gold_type == 'tool':
+                    total_tool_steps += 1
+                elif gold_type == 'answer':
+                    total_answer_steps += 1
+                
+                # Count prediction types
+                if pred_type == 'tool':
+                    tool_call_count += 1
+                    if 'error' in pred_step:
+                        tool_call_error_count += 1
+                
+                # Check if step was successful (no error)
+                if 'error' not in pred_step and pred_step:
                     successful_steps += 1
                     
-                    # Compare tool calls if present
-                    if 'tool_calls' in gold_step and 'tool_calls' in pred_step:
-                        gold_tool = gold_step['tool_calls'][0]['function']['name']
-                        pred_tool = pred_step['tool_calls'][0]['function']['name']
-                        step_accuracy_scores.append(1.0 if gold_tool == pred_tool else 0.0)
-                    elif 'content' in gold_step and 'content' in pred_step:
-                        # For final answers, we'll need more sophisticated comparison
-                        step_accuracy_scores.append(0.5)  # Placeholder
-                    else:
-                        step_accuracy_scores.append(0.0)
-                else:
-                    step_accuracy_scores.append(0.0)
+                    # Instruction alignment: correct step type
+                    if pred_type == gold_type:
+                        inst_align_count += 1
+                        
+                        # Tool accuracy: correct tool name
+                        if gold_type == 'tool':
+                            gold_tool_name = gold_step['tool_calls'][0]['function']['name']
+                            pred_tool_name = pred_step['tool_calls'][0]['function']['name']
+                            
+                            if gold_tool_name == pred_tool_name:
+                                tool_acc_count += 1
+                                
+                                # Arguments accuracy: correct arguments
+                                gold_args = gold_step['tool_calls'][0]['function']['arguments']
+                                pred_args = pred_step['tool_calls'][0]['function']['arguments']
+                                
+                                # Normalize arguments for comparison
+                                if _normalize_args(gold_args) == _normalize_args(pred_args):
+                                    args_acc_count += 1
+                        
+                        # Answer accuracy: correct final answer
+                        elif gold_type == 'answer' and reference:
+                            pred_content = pred_step.get('content', '')
+                            if isinstance(reference, dict):
+                                # Use whitelist/blacklist evaluation
+                                if _check_answer_correctness(pred_content, reference):
+                                    answer_acc_count += 1
+                            elif isinstance(reference, list):
+                                # Use similarity scoring
+                                answer_acc_count += _calculate_similarity_score(pred_content, reference)
             
-            # For overall evaluation, use the traditional format
+            # Add to traditional evaluator data
             all_predictions.append(pred_steps)
             all_ground_truths.append(gold_steps)
-            all_references.append(result.get('reference'))
+            all_references.append(reference)
         
-        # Calculate metrics
+        # Calculate final metrics
         metrics = {
             'total_samples': total_samples,
             'successful_samples': len([r for r in results if 'error' not in r]),
             'total_steps': total_steps,
             'successful_steps': successful_steps,
             'step_success_rate': (successful_steps / total_steps * 100) if total_steps > 0 else 0,
-            'average_step_accuracy': sum(step_accuracy_scores) / len(step_accuracy_scores) if step_accuracy_scores else 0,
+            
+            # GTA benchmark metrics
+            'inst_acc': (inst_align_count / total_steps * 100) if total_steps > 0 else 0,
+            'tool_acc': (tool_acc_count / total_tool_steps * 100) if total_tool_steps > 0 else 0,
+            'args_acc': (args_acc_count / total_tool_steps * 100) if total_tool_steps > 0 else 0,
+            'answer_acc': (answer_acc_count / total_answer_steps * 100) if total_answer_steps > 0 else 0,
+            
+            # Additional statistics
+            'total_tool_steps': total_tool_steps,
+            'total_answer_steps': total_answer_steps,
+            'tool_call_count': tool_call_count,
+            'tool_call_error_count': tool_call_error_count,
             'sample_success_rate': (len([r for r in results if 'error' not in r]) / total_samples * 100) if total_samples > 0 else 0
         }
         
-        # Try to use the original evaluator for additional metrics
+        # Try to use the original evaluator for additional metrics as backup
         try:
             evaluator = GTAEvaluator(mode='every_with_gt')
             additional_metrics = evaluator.evaluate(all_predictions, all_ground_truths, all_references)
-            metrics.update(additional_metrics)
+            # Only add metrics that we haven't calculated ourselves
+            for key, value in additional_metrics.items():
+                if key not in metrics:
+                    metrics[key] = value
         except Exception as e:
-            logger.warning(f"Could not calculate additional metrics: {e}")
+            logger.warning(f"Could not calculate additional metrics with GTAEvaluator: {e}")
         
         # Save metrics
         metrics_file = os.path.join(output_dir, 'step_by_step_metrics.json')
@@ -406,8 +531,86 @@ def calculate_step_by_step_metrics(results: List[Dict], output_dir: str) -> Dict
         return metrics
         
     except Exception as e:
-        logger.error(f"Error calculating step-by-step metrics: {e}")
-        return {}
+        logger.error(f"Critical Error calculating step-by-step metrics: {e}")
+        raise e
+
+
+def _get_step_type(step: Dict) -> str:
+    """Determine the type of a step (tool, answer, or error)."""
+    if 'error' in step:
+        return 'error'
+    elif 'tool_calls' in step and step['tool_calls']:
+        return 'tool'
+    elif step.get('role') == 'assistant' and 'content' in step:
+        return 'answer'
+    else:
+        return 'unknown'
+
+
+def _normalize_args(args) -> str:
+    """Normalize arguments for comparison."""
+    if isinstance(args, str):
+        try:
+            # Try to parse as JSON and re-serialize for consistent formatting
+            import json
+            parsed = json.loads(args)
+            return json.dumps(parsed, sort_keys=True)
+        except (json.JSONDecodeError, TypeError):
+            return str(args).strip()
+    elif isinstance(args, dict):
+        import json
+        return json.dumps(args, sort_keys=True)
+    else:
+        return str(args).strip()
+
+
+def _check_answer_correctness(pred_content: str, reference: Dict) -> bool:
+    """Check if prediction matches reference using whitelist/blacklist."""
+    import re
+    
+    if not isinstance(reference, dict) or 'whitelist' not in reference:
+        return False
+        
+    count = 0
+    for aliases in reference['whitelist']:
+        pattern = r'\b(?:' + '|'.join(re.escape(alias) for alias in aliases) + r')\b'
+        if re.search(pattern, pred_content, re.IGNORECASE):
+            count += 1
+            
+    if not reference.get('blacklist'):
+        if count == len(reference['whitelist']):
+            return True
+    else:
+        pattern_bk = r'\b(?:' + '|'.join(re.escape(alias) for aliases in reference['blacklist'] for alias in aliases) + r')\b'
+        if count == len(reference['whitelist']) and not re.search(pattern_bk, pred_content, re.IGNORECASE):
+            return True
+    return False
+
+
+def _calculate_similarity_score(pred_content: str, reference_list: List[str]) -> float:
+    """Calculate similarity score using sentence transformers if available."""
+    try:
+        from sentence_transformers import SentenceTransformer, util
+        import numpy as np
+        
+        model = SentenceTransformer('all-mpnet-base-v2')
+        pred_emb = model.encode(pred_content, convert_to_tensor=True)
+        
+        max_score = 0.0
+        for ref_text in reference_list:
+            ref_emb = model.encode(ref_text, convert_to_tensor=True)
+            score = np.maximum(util.cos_sim(pred_emb, ref_emb).cpu().numpy(), 0)
+            if score[0][0] > max_score:
+                max_score = score[0][0]
+        
+        return float(max_score)
+    except ImportError:
+        # Fallback to simple string matching
+        pred_lower = pred_content.lower()
+        for ref_text in reference_list:
+            if ref_text.lower() in pred_lower or pred_lower in ref_text.lower():
+                return 1.0
+        return 0.0
 
 
 def calculate_metrics(predictions: List, ground_truths: List, references: List, 
@@ -465,7 +668,8 @@ def print_step_by_step_analysis(results: List[Dict], num_samples: int = 3):
                 # Gold step
                 if 'tool_calls' in gold:
                     gold_tool = gold['tool_calls'][0]['function']['name']
-                    print(f"    Gold: Tool call - {gold_tool}")
+                    gold_args = gold['tool_calls'][0]['function']['arguments']
+                    print(f"    Gold: {_analyze_tool_call_arguments(gold['tool_calls'][0])}")
                 else:
                     gold_content = gold.get('content', '')[:50]
                     print(f"    Gold: Content - {gold_content}...")
@@ -475,16 +679,22 @@ def print_step_by_step_analysis(results: List[Dict], num_samples: int = 3):
                     print(f"    Pred: ERROR - {pred['error'].get('msg', 'Unknown error')}")
                 elif 'tool_calls' in pred:
                     pred_tool = pred['tool_calls'][0]['function']['name']
-                    print(f"    Pred: Tool call - {pred_tool}")
+                    pred_args = pred['tool_calls'][0]['function']['arguments']
+                    print(f"    Pred: {_analyze_tool_call_arguments(pred['tool_calls'][0])}")
                     
                     # Check if tools match
                     if 'tool_calls' in gold:
                         match = gold['tool_calls'][0]['function']['name'] == pred_tool
                         print(f"    Match: {'✓' if match else '✗'}")
+                        
+                        # Check if arguments match (if both are parsed)
+                        if (isinstance(gold_args, dict) and isinstance(pred_args, dict)):
+                            args_match = gold_args == pred_args
+                            print(f"    Args Match: {'✓' if args_match else '✗'}")
                 else:
                     pred_content = pred.get('content', '')[:50]
+                    pred_content = pred_content.replace('\n', ' ')
                     print(f"    Pred: Content - {pred_content}...")
-
 
 def print_sample_analysis(results: List[Dict], num_samples: int = 3):
     """Print analysis of a few sample results (original method)."""
@@ -522,11 +732,14 @@ def main():
     """Main evaluation function."""
     args = parse_args()
     
+    # Set up output directory using model_alias from config
+    output_dir = setup_output_dir(args.config)
+    
     logger.info("Starting Standalone GTA Benchmark Evaluation")
     logger.info(f"Model: {args.model}")
     logger.info(f"Config: {args.config}")
     logger.info(f"Dataset Path: {args.dataset_path}")
-    logger.info(f"Output Directory: {args.output_dir}")
+    logger.info(f"Output Directory: {output_dir}")
     logger.info(f"Step-by-step mode: {args.step_by_step}")
     
     try:
@@ -538,18 +751,18 @@ def main():
         
         # Run evaluation
         results = run_evaluation(
-            model, dataset, args.output_dir, args.max_turns, args.save_steps, args.step_by_step, args.n_samples
+            model, dataset, output_dir, args.max_turns, args.save_steps, args.step_by_step, args.n_samples
         )
         
         # Calculate metrics
         if args.step_by_step:
-            metrics = calculate_step_by_step_metrics(results, args.output_dir)
+            metrics = calculate_step_by_step_metrics(results, output_dir)
         else:
             # Extract data for traditional metrics calculation
             predictions = [r.get('prediction', []) for r in results]
             ground_truths = [r.get('ground_truth', []) for r in results]
             references = [r.get('reference') for r in results]
-            metrics = calculate_metrics(predictions, ground_truths, references, args.output_dir)
+            metrics = calculate_metrics(predictions, ground_truths, references, output_dir)
         
         logger.info("Evaluation completed successfully!")
         
@@ -561,7 +774,7 @@ def main():
         print(f"Configuration: {args.config}")
         print(f"Samples Evaluated: {len(dataset)}")
         print(f"Evaluation Mode: {'Step-by-step' if args.step_by_step else 'Standard'}")
-        print(f"Results saved to: {args.output_dir}")
+        print(f"Results saved to: {output_dir}")
         
         print("\nKey Metrics:")
         for key, value in metrics.items():
@@ -581,7 +794,8 @@ def main():
         print("="*70)
         
     except Exception as e:
-        logger.error(f"Evaluation failed: {e}")
+        logger.error(f"Evaluation failed: Critical Error {e}")
+        raise e
         sys.exit(1)
 
 
