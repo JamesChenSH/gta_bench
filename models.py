@@ -134,6 +134,28 @@ class GTAModel:
                             "id": "call_1"
                         }
                     ]
+                elif 'tool▁call' in message['content']:
+                    # For R1 format
+                    tool_call_str = message['content'].split('<｜tool▁call▁begin｜>')[1].split('<｜tool▁call▁end｜>')[0]
+
+                    if '｜tool▁sep｜' in tool_call_str:
+                        tool_call_str = tool_call_str.split('｜tool▁sep｜')[1]
+                        # Remove the json``` and ```
+                        tool_call_name = tool_call_str.split('```json')[0][1:-1]
+                        tool_call_str = tool_call_str.split('```json')[1].split('```')[0]
+
+                        tool_call_dict = {
+                            "name": tool_call_name,
+                            "arguments": json.loads(tool_call_str)
+                        }
+                    else:
+                        tool_call_str = tool_call_str.split('```json')[1].split('```')[0]
+                        tool_call_dict = json.loads(tool_call_str)
+
+                    message['tool_calls'] = [{
+                        "function": tool_call_dict,
+                        "id": "call_1"
+                    }]
                 else:
                     message['tool_calls'] = []
 
@@ -270,8 +292,27 @@ class GTAAgent:
         
         # Add system message if files are provided
         if files:
-            file_info = "You are a helpful assistant that can use the following files to answer the user's question. These are the files: " + ", ".join([f"`{f['path']}`" for f in files])
+            file_info = """
+            You are a helpful assistant that can use the following files to answer the user's question. 
+            The files included should have enough information to answer the user's question. You should
+            try to use the tools provided to provide a response to user's question.
+
+            The tools provided are: 
+            {tools}
+
+            These are the files: 
+            {files}
+            """.format(tools="\n".join(str(tool) for tool in tools), files="\n".join([f"`{f['path']}`" for f in files]))
             messages.append({'role': 'system', 'content': file_info})
+        else:
+            system_message = """
+            You are a helpful assistant that can use the following tools to answer the user's question. You should
+            try to use the tools provided to provide a response to user's question.
+
+            The tools provided are: 
+            {tools}
+            """.format(tools="\n".join(str(tool) for tool in tools))
+            messages.append({'role': 'system', 'content': system_message})
         
         # Add the provided chat history
         messages.extend(chat_history)
@@ -295,7 +336,8 @@ class GTAAgent:
             # Return tool call message
             return {
                 'role': 'assistant',
-                'tool_calls': message['tool_calls']
+                'tool_calls': message['tool_calls'],
+                'content': message.get('content', '')
             }
         else:
             # Return text response

@@ -76,6 +76,10 @@ def parse_args():
                        help='Enable step-by-step evaluation with ground truth tool outputs')
     parser.add_argument('--n_samples', type=int, default=500,
                        help='Number of samples to evaluate')
+    parser.add_argument('--standalone', action='store_true',
+                       help='Run standalone evaluation on existing results file')
+    parser.add_argument('--results_file', type=str,
+                       help='Path to existing evaluation_results.json for standalone evaluation')
     return parser.parse_args()
 
 
@@ -468,7 +472,7 @@ def calculate_step_by_step_metrics(results: List[Dict], output_dir: str) -> Dict
                                     args_acc_count += 1
                         
                         # Answer accuracy: correct final answer
-                        elif gold_type == 'answer' and reference:
+                        elif gold_type == 'answer' and reference and i == len(gold_steps) - 1:
                             pred_content = pred_step.get('content', '')
                             if isinstance(reference, dict):
                                 # Use whitelist/blacklist evaluation
@@ -489,10 +493,10 @@ def calculate_step_by_step_metrics(results: List[Dict], output_dir: str) -> Dict
             'successful_samples': len([r for r in results if 'error' not in r]),
             'total_steps': total_steps,
             'successful_steps': successful_steps,
-            'step_success_rate': (successful_steps / total_steps * 100) if total_steps > 0 else 0,
+            'step_success_rate(inst_acc)': (successful_steps / total_steps * 100) if total_steps > 0 else 0,
             
             # GTA benchmark metrics
-            'inst_acc': (inst_align_count / total_steps * 100) if total_steps > 0 else 0,
+            'type_acc': (inst_align_count / total_steps * 100) if total_steps > 0 else 0,
             'tool_acc': (tool_acc_count / total_tool_steps * 100) if total_tool_steps > 0 else 0,
             'args_acc': (args_acc_count / total_tool_steps * 100) if total_tool_steps > 0 else 0,
             'answer_acc': (answer_acc_count / total_answer_steps * 100) if total_answer_steps > 0 else 0,
@@ -603,7 +607,7 @@ def _calculate_similarity_score(pred_content: str, reference_list: List[str]) ->
             if score[0][0] > max_score:
                 max_score = score[0][0]
         
-        return float(max_score)
+        return max_score
     except ImportError:
         # Fallback to simple string matching
         pred_lower = pred_content.lower()
@@ -728,9 +732,55 @@ def print_sample_analysis(results: List[Dict], num_samples: int = 3):
                     print(f"  {j+1}. {role}: {content}...")
 
 
+def run_standalone_evaluation(results_file: str, output_dir: str) -> None:
+    """Run standalone evaluation on existing results file."""
+    logger.info(f"Running standalone evaluation on {results_file}")
+    
+    try:
+        # Load existing results
+        with open(results_file, 'r') as f:
+            results = json.load(f)
+        
+        # Calculate metrics
+        metrics = calculate_step_by_step_metrics(results, output_dir)
+        
+        logger.info("Standalone evaluation completed successfully!")
+        
+        # Print comprehensive summary
+        print("\n" + "="*70)
+        print("STANDALONE GTA BENCHMARK EVALUATION SUMMARY")
+        print("="*70)
+        print(f"Results File: {results_file}")
+        print(f"Results saved to: {output_dir}")
+        
+        print("\nKey Metrics:")
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.2f}%")
+            else:
+                print(f"  {key}: {value}")
+        
+        print("\n" + "="*70)
+        print("✅ Evaluation completed! Check the output directory for detailed results.")
+        print("="*70)
+        
+    except Exception as e:
+        logger.error(f"Standalone evaluation failed: {e}")
+        raise
+
 def main():
     """Main evaluation function."""
     args = parse_args()
+    if args.standalone:
+        if not args.results_file:
+            logger.error("--results_file is required for standalone evaluation")
+            sys.exit(1)
+        if not args.output_dir:
+            args.output_dir = f'outputs/standalone_eval_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        
+        # Run standalone evaluation
+        run_standalone_evaluation(args.results_file, args.output_dir)
+        return
     
     # Set up output directory using model_alias from config
     output_dir = setup_output_dir(args.config)
