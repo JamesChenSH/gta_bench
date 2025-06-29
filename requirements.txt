@@ -4,6 +4,7 @@
 requests>=2.28.0
 sentence-transformers>=2.2.0
 numpy>=1.21.0
+openai>=1.93.0  # Required for Azure OpenAI SDK
 
 # Optional for enhanced similarity scoring
 torch>=1.12.0

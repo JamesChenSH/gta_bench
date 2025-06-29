@@ -689,7 +689,7 @@ def print_step_by_step_analysis(results: List[Dict], num_samples: int = 3):
                     # Check if tools match
                     if 'tool_calls' in gold:
                         match = gold['tool_calls'][0]['function']['name'] == pred_tool
-                        print(f"    Match: {'✓' if match else '✗'}")
+                        print(f"    Tool Match: {'✓' if match else '✗'}")
                         
                         # Check if arguments match (if both are parsed)
                         if (isinstance(gold_args, dict) and isinstance(pred_args, dict)):

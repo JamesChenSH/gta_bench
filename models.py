@@ -8,6 +8,8 @@ import logging
 import time
 from typing import List, Dict, Any, Optional
 import requests
+import os
+from openai import AzureOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +61,7 @@ class GTAModel:
                 
                 properties[param_name] = {
                     'type': schema_type,
-                    'description': input_param.get('description', f'{param_name} parameter')
+                    'description': input_param.get('description') if input_param.get('description', None) is not None else f'{param_name} parameter'
                 }
                 
                 if not input_param.get('optional', False):
@@ -78,7 +80,6 @@ class GTAModel:
                 }
             }
             openai_tools.append(openai_tool)
-            
         return openai_tools
     
     def generate(self, messages: List[Dict], tools: Optional[List[Dict]] = None) -> Dict:
@@ -141,7 +142,7 @@ class GTAModel:
                     if '｜tool▁sep｜' in tool_call_str:
                         tool_call_str = tool_call_str.split('｜tool▁sep｜')[1]
                         # Remove the json``` and ```
-                        tool_call_name = tool_call_str.split('```json')[0][1:-1]
+                        tool_call_name = tool_call_str.split('```json')[0]
                         tool_call_str = tool_call_str.split('```json')[1].split('```')[0]
 
                         tool_call_dict = {
@@ -359,15 +360,142 @@ class GTAAgent:
         return f"Tool {tool_name} executed with arguments {arguments}. [Dummy result]"
 
 
-def create_model_from_config(config_file: str) -> GTAModel:
-    """Create a model instance from a configuration file."""
-    with open(config_file, 'r') as f:
-        config = json.load(f)
+class AzureGTAModel(GTAModel):
+    """
+    Azure OpenAI model implementation using the official OpenAI SDK.
+    """
     
-    return GTAModel(
-        model_name=config.get('model_alias', 'unknown'),
-        api_base=f"http://{config['host']}:{config['port']}/v1",
-        api_key='EMPTY',
-        max_tokens=config.get('n_ctx', 4096),
-        temperature=0.1
-    ) 
+    def __init__(self, 
+                 model_name: str = 'gpt-4',
+                 api_base: str = None,
+                 api_key: str = None,
+                 api_version: str = '2024-02-15-preview',
+                 deployment_name: str = None,
+                 max_tokens: int = 4096,
+                 temperature: float = 0.1,
+                 timeout: int = 60):
+        super().__init__(model_name=model_name,
+                        api_base=api_base,
+                        api_key=api_key,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        timeout=timeout)
+        self.api_version = api_version
+        self.deployment_name = deployment_name or model_name
+        
+        # Initialize Azure OpenAI client
+        self.client = AzureOpenAI(
+            api_key=self.api_key,
+            api_version=self.api_version,
+            azure_endpoint=self.api_base
+        )
+        
+    def generate(self, messages: List[Dict], tools: Optional[List[Dict]] = None) -> Dict:
+        """
+        Generate response using Azure OpenAI API via the official SDK.
+        
+        Args:
+            messages: List of conversation messages
+            tools: Optional list of available tools
+            
+        Returns:
+            Dict containing the response
+        """
+        try:
+            # Prepare completion parameters
+            completion_params = {
+                'model': self.deployment_name,
+                'messages': messages,
+                'timeout': self.timeout
+            }
+            
+            # Add tools if provided
+            if tools:
+                openai_tools = self.convert_tools_to_openai_format(tools)
+                completion_params['tools'] = openai_tools
+                completion_params['tool_choice'] = 'auto'
+            
+            if self.deployment_name == 'o4-mini':
+                completion_params['max_completion_tokens'] = self.max_tokens
+            else:
+                completion_params['temperature'] = self.temperature
+                completion_params['max_tokens'] = self.max_tokens
+
+            # Make API request using the SDK
+            response = self.client.chat.completions.create(**completion_params)
+            
+            # Extract the message from the response
+            choice = response.choices[0]
+            message = {
+                'role': choice.message.role,
+                'content': choice.message.content
+            }
+            
+            # Handle tool calls if present
+            if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
+                tool_calls = []
+                for tool_call in choice.message.tool_calls:
+                    tool_calls.append({
+                        'id': tool_call.id,
+                        'function': {
+                            'name': tool_call.function.name,
+                            'arguments': tool_call.function.arguments
+                        }
+                    })
+                message['tool_calls'] = tool_calls
+            
+            return {
+                'success': True,
+                'message': message,
+                'usage': {
+                    'prompt_tokens': response.usage.prompt_tokens,
+                    'completion_tokens': response.usage.completion_tokens,
+                    'total_tokens': response.usage.total_tokens
+                },
+                'model': response.model
+            }
+                
+        except Exception as e:
+            logger.error(f"Azure OpenAI API error: {str(e)}")
+            return {
+                'success': False,
+                'error': f'Azure OpenAI API error: {str(e)}'
+            }
+
+
+def create_model_from_config(config_file: str) -> GTAModel:
+    """Create model instance from configuration file."""
+    try:
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+            
+        if not config.get('models'):
+            raise ValueError("No models defined in config")
+            
+        model_config = config['models'][0]  # Use first model config
+        model_type = model_config.get('type', 'default')
+        
+        # Common parameters
+        model_params = {
+            'model_name': model_config.get('model_name'),
+            'api_base': model_config.get('api_base'),
+            'api_key': model_config.get('api_key', os.getenv('OPENAI_API_KEY')),
+            'max_tokens': model_config.get('max_tokens', 4096),
+            'temperature': model_config.get('temperature', 0.1),
+            'timeout': model_config.get('timeout', 60)
+        }
+        
+        if model_type == 'azure':
+            # Azure-specific parameters
+            azure_params = {
+                'api_version': model_config.get('api_version', '2024-02-15-preview'),
+                'deployment_name': model_config.get('deployment_name')
+            }
+            model_params.update(azure_params)
+            return AzureGTAModel(**model_params)
+        else:
+            return GTAModel(**model_params)
+            
+    except Exception as e:
+        logger.error(f"Failed to create model from config: {e}")
+        raise 
