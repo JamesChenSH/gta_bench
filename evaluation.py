@@ -17,10 +17,16 @@ from datetime import datetime
 import copy
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from pydantic import BaseModel
 
 from models import GTAModel, GTAAgent, create_model_from_config
 from dataset import GTADataset, GTAEvaluator
+from utils import parse_args
+
+class JudgeResponse(BaseModel):
+    is_correct: bool
+    reason: str
 
 # Set up logging
 logging.basicConfig(
@@ -51,36 +57,6 @@ def setup_output_dir(config_file: str) -> str:
     output_dir = os.path.join('outputs', f'{timestamp}_{model_alias}')
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
-
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Standalone GTA benchmark evaluation with step-by-step mode')
-    parser.add_argument('--model', type=str, default='qwen3-8b',
-                       help='Model name to evaluate')
-    parser.add_argument('--config', type=str, default='llama_cpp_server_qwen8b.json',
-                       help='Server configuration file')
-    parser.add_argument('--dataset_path', type=str, default='data/gta_dataset',
-                       help='Path to GTA dataset')
-    parser.add_argument('--output_dir', type=str, default='outputs/standalone_gta',
-                       help='Output directory for results')
-    parser.add_argument('--max_samples', type=int, default=None,
-                       help='Maximum number of samples to evaluate (for testing)')
-    parser.add_argument('--max_turns', type=int, default=10,
-                       help='Maximum number of conversation turns')
-    parser.add_argument('--temperature', type=float, default=0.1,
-                       help='Temperature for model generation')
-    parser.add_argument('--save_steps', type=int, default=45,
-                       help='Save steps')
-    parser.add_argument('--step_by_step', action='store_true', default=True,
-                       help='Enable step-by-step evaluation with ground truth tool outputs')
-    parser.add_argument('--n_samples', type=int, default=500,
-                       help='Number of samples to evaluate')
-    parser.add_argument('--standalone', action='store_true',
-                       help='Run standalone evaluation on existing results file')
-    parser.add_argument('--results_file', type=str,
-                       help='Path to existing evaluation_results.json for standalone evaluation')
-    return parser.parse_args()
 
 
 def load_dataset(dataset_path: str, max_samples: int = None) -> GTADataset:
@@ -115,32 +91,6 @@ def create_model(config_file: str, model_name: str, temperature: float) -> GTAMo
     except Exception as e:
         logger.error(f"Failed to create model: {e}")
         raise
-
-
-def _analyze_tool_call_arguments(tool_call: Dict) -> str:
-    """Analyze and format tool call arguments for display."""
-    if 'function' not in tool_call:
-        return "No function found in tool call"
-    
-    function = tool_call['function']
-    tool_name = function.get('name', 'Unknown')
-    arguments = function.get('arguments', {})
-    
-    if isinstance(arguments, dict):
-        # Arguments are already parsed
-        args_str = ", ".join([f"{k}={v}" for k, v in arguments.items()])
-        return f"{tool_name}({args_str})"
-    elif isinstance(arguments, str):
-        # Arguments are still a JSON string
-        try:
-            import json
-            parsed_args = json.loads(arguments)
-            args_str = ", ".join([f"{k}={v}" for k, v in parsed_args.items()])
-            return f"{tool_name}({args_str})"
-        except (json.JSONDecodeError, TypeError):
-            return f"{tool_name}({arguments})"
-    else:
-        return f"{tool_name}({arguments})"
 
 
 def extract_assistant_steps(dialogs: List[Dict]) -> List[Dict]:
@@ -407,12 +357,14 @@ def calculate_step_by_step_metrics(results: List[Dict], output_dir: str) -> Dict
         all_predictions = []
         all_ground_truths = []
         all_references = []
+        all_incorrect_answers = []
         
         for result in results:
             if 'error' in result:
                 all_predictions.append([])
                 all_ground_truths.append([])
                 all_references.append(result.get('reference'))
+                all_incorrect_answers.append([])
                 continue
                 
             gold_steps = result.get('gold', [])
@@ -473,14 +425,27 @@ def calculate_step_by_step_metrics(results: List[Dict], output_dir: str) -> Dict
                         
                         # Answer accuracy: correct final answer
                         elif gold_type == 'answer' and reference and i == len(gold_steps) - 1:
-                            pred_content = pred_step.get('content', '')
-                            if isinstance(reference, dict):
-                                # Use whitelist/blacklist evaluation
-                                if _check_answer_correctness(pred_content, reference):
-                                    answer_acc_count += 1
-                            elif isinstance(reference, list):
-                                # Use similarity scoring
-                                answer_acc_count += _calculate_similarity_score(pred_content, reference)
+                            # pred_content = pred_step.get('content', '')
+                            # if isinstance(reference, dict):
+                            #     # Use whitelist/blacklist evaluation
+                            #     if _check_answer_correctness_dict(pred_content, reference):
+                            #         answer_acc_count += 1
+                            #     else:
+                            #         all_incorrect_answers.append({
+                            #             "prompt": result.get('origin_prompt', [])[-1],
+                            #             "pred": pred_content,
+                            #             "gt": reference
+                            #         })
+                            # elif isinstance(reference, list):
+                            #     # Use similarity scoring
+                            #     answer_acc_count += _calculate_similarity_score(pred_content, reference)
+                            #     all_incorrect_answers.append({
+                            #         "prompt": result.get('origin_prompt', [])[-1],
+                            #         "pred": pred_content,
+                            #         "gt": reference
+                            #     })
+                            answer_acc_count += check_answer_correctness_llm(pred_step.get('content', ''), reference)
+
             
             # Add to traditional evaluator data
             all_predictions.append(pred_steps)
@@ -510,15 +475,16 @@ def calculate_step_by_step_metrics(results: List[Dict], output_dir: str) -> Dict
         }
         
         # Try to use the original evaluator for additional metrics as backup
-        try:
-            evaluator = GTAEvaluator(mode='every_with_gt')
-            additional_metrics = evaluator.evaluate(all_predictions, all_ground_truths, all_references)
-            # Only add metrics that we haven't calculated ourselves
-            for key, value in additional_metrics.items():
-                if key not in metrics:
-                    metrics[key] = value
-        except Exception as e:
-            logger.warning(f"Could not calculate additional metrics with GTAEvaluator: {e}")
+        # Deprecated. They are all overlapping.
+        # try:
+        #     evaluator = GTAEvaluator(mode='every_with_gt')
+        #     additional_metrics = evaluator.evaluate(all_predictions, all_ground_truths, all_references)
+        #     # Only add metrics that we haven't calculated ourselves
+        #     for key, value in additional_metrics.items():
+        #         if key not in metrics:
+        #             metrics[key] = value
+        # except Exception as e:
+        #     logger.warning(f"Could not calculate additional metrics with GTAEvaluator: {e}")
         
         # Save metrics
         metrics_file = os.path.join(output_dir, 'step_by_step_metrics.json')
@@ -532,8 +498,14 @@ def calculate_step_by_step_metrics(results: List[Dict], output_dir: str) -> Dict
             else:
                 logger.info(f"  {key}: {value}")
         
+        # Save incorrect answers
+        incorrect_answers_file = os.path.join(output_dir, 'incorrect_answers.json')
+        with open(incorrect_answers_file, 'w') as f:
+            json.dump(all_incorrect_answers, f, indent=2)
+        logger.info(f"Saved incorrect answers to {incorrect_answers_file}")
+
         return metrics
-        
+    
     except Exception as e:
         logger.error(f"Critical Error calculating step-by-step metrics: {e}")
         raise e
@@ -568,9 +540,10 @@ def _normalize_args(args) -> str:
         return str(args).strip()
 
 
-def _check_answer_correctness(pred_content: str, reference: Dict) -> bool:
+def _check_answer_correctness_dict(pred_content: str, reference: Dict) -> bool:
     """Check if prediction matches reference using whitelist/blacklist."""
     import re
+    pred_content = pred_content.replace(',', '')
     
     if not isinstance(reference, dict) or 'whitelist' not in reference:
         return False
@@ -645,93 +618,6 @@ def calculate_metrics(predictions: List, ground_truths: List, references: List,
         return {}
 
 
-def print_step_by_step_analysis(results: List[Dict], num_samples: int = 3):
-    """Print analysis of step-by-step results."""
-    print("\n" + "="*60)
-    print("STEP-BY-STEP SAMPLE ANALYSIS")
-    print("="*60)
-    
-    for i, result in enumerate(results[:num_samples]):
-        print(f"\nSample {i+1} (ID: {result['idx']}):")
-        print(f"User Query: {result.get('user_query', 'N/A')}")
-        print(f"Tools Available: {result.get('tools_available', [])}")
-        print(f"Duration: {result.get('duration', 0):.2f}s")
-        print(f"Total Steps: {result.get('total_steps', 0)}")
-        print(f"Successful Steps: {result.get('successful_steps', 0)}")
-        
-        if 'error' in result:
-            print(f"Error: {result['error']}")
-        else:
-            gold_steps = result.get('gold', [])
-            pred_steps = result.get('prediction', [])
-            
-            print(f"\nStep-by-step comparison:")
-            for j, (gold, pred) in enumerate(zip(gold_steps, pred_steps)):
-                print(f"  Step {j+1}:")
-                
-                # Gold step
-                if 'tool_calls' in gold:
-                    gold_tool = gold['tool_calls'][0]['function']['name']
-                    gold_args = gold['tool_calls'][0]['function']['arguments']
-                    print(f"    Gold: {_analyze_tool_call_arguments(gold['tool_calls'][0])}")
-                else:
-                    gold_content = gold.get('content', '')[:50]
-                    print(f"    Gold: Content - {gold_content}...")
-                
-                # Prediction step
-                if 'error' in pred:
-                    print(f"    Pred: ERROR - {pred['error'].get('msg', 'Unknown error')}")
-                elif 'tool_calls' in pred:
-                    pred_tool = pred['tool_calls'][0]['function']['name']
-                    pred_args = pred['tool_calls'][0]['function']['arguments']
-                    print(f"    Pred: {_analyze_tool_call_arguments(pred['tool_calls'][0])}")
-                    
-                    # Check if tools match
-                    if 'tool_calls' in gold:
-                        match = gold['tool_calls'][0]['function']['name'] == pred_tool
-                        print(f"    Tool Match: {'✓' if match else '✗'}")
-                        
-                        # Check if arguments match (if both are parsed)
-                        if (isinstance(gold_args, dict) and isinstance(pred_args, dict)):
-                            args_match = gold_args == pred_args
-                            print(f"    Args Match: {'✓' if args_match else '✗'}")
-                else:
-                    pred_content = pred.get('content', '')[:50]
-                    pred_content = pred_content.replace('\n', ' ')
-                    print(f"    Pred: Content - {pred_content}...")
-
-def print_sample_analysis(results: List[Dict], num_samples: int = 3):
-    """Print analysis of a few sample results (original method)."""
-    print("\n" + "="*60)
-    print("SAMPLE ANALYSIS")
-    print("="*60)
-    
-    for i, result in enumerate(results[:num_samples]):
-        print(f"\nSample {i+1} (ID: {result['idx']}):")
-        print(f"User Query: {result.get('user_query', 'N/A')}")
-        print(f"Tools Available: {result.get('tools_available', [])}")
-        print(f"Duration: {result.get('duration', 0):.2f}s")
-        
-        if 'error' in result:
-            print(f"Error: {result['error']}")
-        else:
-            pred_len = len(result.get('prediction', []))
-            gt_len = len(result.get('ground_truth', []))
-            print(f"Prediction Length: {pred_len} turns")
-            print(f"Ground Truth Length: {gt_len} turns")
-            
-            # Show first few turns
-            print("First few prediction turns:")
-            for j, turn in enumerate(result.get('prediction', [])[:3]):
-                role = turn.get('role', 'unknown')
-                if 'tool_calls' in turn:
-                    tool_name = turn['tool_calls'][0]['function']['name']
-                    print(f"  {j+1}. {role}: [Tool call: {tool_name}]")
-                else:
-                    content = turn.get('content', '')[:100]
-                    print(f"  {j+1}. {role}: {content}...")
-
-
 def run_standalone_evaluation(results_file: str, output_dir: str) -> None:
     """Run standalone evaluation on existing results file."""
     logger.info(f"Running standalone evaluation on {results_file}")
@@ -767,6 +653,46 @@ def run_standalone_evaluation(results_file: str, output_dir: str) -> None:
     except Exception as e:
         logger.error(f"Standalone evaluation failed: {e}")
         raise
+
+
+def check_answer_correctness_llm(pred_content: str, gt_content: Optional[dict | list], judge_llm: str='qwen3-8b') -> dict:
+    """
+    Use a LLM as a judge to determine if the prediction is correct.
+    """
+
+    output_format = JudgeResponse.model_json_schema()
+
+    system_prompt = f"""
+    You are a helpful assistant that have basic problem solving skills. You are
+    tasked to determine whether the prediction correctly solves the problem by
+    checking whether the prediction matches the ground truth answers. If the
+    ground truth is a list, you should check whether the prediction matches
+    one of the ground truth answers. If the ground truth is a dict, you should
+    check whether the prediction matches *all* the answers in the whitelist, 
+    while does not have *any* of the answers in the blacklist.
+    """
+
+    user_prompt = f"""
+    Here is the prediction:
+    {pred_content}
+
+    Here is the ground truth:
+    {gt_content}
+    """
+    config_file = 'llama_cpp_server_qwen8b.json'
+
+    model = create_model_from_config(config_file)
+
+    response = model.generate(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}],
+        tools=[],
+        output_format=output_format
+    )
+    del model
+    return json.loads(response['message']['content'])['is_correct']
+
 
 def main():
     """Main evaluation function."""
@@ -833,12 +759,6 @@ def main():
             else:
                 print(f"  {key}: {value}")
         
-        # Print sample analysis
-        if args.step_by_step:
-            print_step_by_step_analysis(results)
-        else:
-            print_sample_analysis(results)
-        
         print("\n" + "="*70)
         print("✅ Evaluation completed! Check the output directory for detailed results.")
         print("="*70)
@@ -847,6 +767,9 @@ def main():
         logger.error(f"Evaluation failed: Critical Error {e}")
         raise e
         sys.exit(1)
+
+
+
 
 
 if __name__ == '__main__':

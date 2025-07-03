@@ -82,7 +82,7 @@ class GTAModel:
             openai_tools.append(openai_tool)
         return openai_tools
     
-    def generate(self, messages: List[Dict], tools: Optional[List[Dict]] = None) -> Dict:
+    def generate(self, messages: List[Dict], tools: Optional[List[Dict]] = None, output_format: Optional[Dict] = None) -> Dict:
         """
         Generate response using proper OpenAI tool call API.
         
@@ -106,6 +106,12 @@ class GTAModel:
             openai_tools = self.convert_tools_to_openai_format(tools)
             payload['tools'] = openai_tools
             payload['tool_choice'] = 'auto'
+
+        if output_format:
+            payload['response_format'] = {
+                "type": "json_object",
+                "schema": output_format
+            }
         
         # Make API request
         headers = {
@@ -136,7 +142,7 @@ class GTAModel:
                         }
                     ]
                 elif 'tool▁call' in message['content']:
-                    # For R1 format
+                    # For Deepseek format
                     tool_call_str = message['content'].split('<｜tool▁call▁begin｜>')[1].split('<｜tool▁call▁end｜>')[0]
 
                     if '｜tool▁sep｜' in tool_call_str:
@@ -358,6 +364,7 @@ class GTAAgent:
         # For demonstration, return a dummy result
         # In practice, this would call the actual tool implementation
         return f"Tool {tool_name} executed with arguments {arguments}. [Dummy result]"
+    
 
 
 class AzureGTAModel(GTAModel):
@@ -415,7 +422,7 @@ class AzureGTAModel(GTAModel):
                 completion_params['tools'] = openai_tools
                 completion_params['tool_choice'] = 'auto'
             
-            if self.deployment_name == 'o4-mini':
+            if self.deployment_name == 'o4-mini' or self.deployment_name.startswith('o'):
                 completion_params['max_completion_tokens'] = self.max_tokens
             else:
                 completion_params['temperature'] = self.temperature
@@ -477,10 +484,10 @@ def create_model_from_config(config_file: str) -> GTAModel:
         
         # Common parameters
         model_params = {
-            'model_name': model_config.get('model_name'),
-            'api_base': model_config.get('api_base'),
-            'api_key': model_config.get('api_key', os.getenv('OPENAI_API_KEY')),
-            'max_tokens': model_config.get('max_tokens', 4096),
+            'model_name': model_config.get('model_alias'),
+            'api_base': 'http://0.0.0.0:8080/v1',
+            'api_key': 'EMPTY',
+            'max_tokens': model_config.get('n_ctx', 4096),
             'temperature': model_config.get('temperature', 0.1),
             'timeout': model_config.get('timeout', 60)
         }
