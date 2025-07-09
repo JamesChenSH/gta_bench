@@ -1,7 +1,8 @@
 # 🚀 Standalone GTA Benchmark Evaluation
 
 This standalone implementation provides a clean, dependency-free solution that uses proper OpenAI tool call API structure.
-Original Repo: https://github.com/open-compass/GTA
+
+Original Repo for GTA Benchmark we use: https://github.com/open-compass/GTA
 
 ## 🎯 Why Standalone?
 
