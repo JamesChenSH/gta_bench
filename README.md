@@ -1,6 +1,7 @@
 # 🚀 Standalone GTA Benchmark Evaluation
 
-**You're absolutely right!** You **don't need OpenCompass** for GTA benchmark evaluation. This standalone implementation provides a clean, dependency-free solution that uses proper OpenAI tool call API structure.
+This standalone implementation provides a clean, dependency-free solution that uses proper OpenAI tool call API structure.
+Original Repo: https://github.com/open-compass/GTA
 
 ## 🎯 Why Standalone?
 
